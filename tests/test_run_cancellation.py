@@ -20,7 +20,9 @@ trigger.
 from __future__ import annotations as _annotations
 
 import asyncio
+import gc
 import pickle
+import sys
 import threading
 from collections.abc import AsyncIterable, AsyncIterator, Generator
 from contextlib import contextmanager
@@ -62,7 +64,7 @@ from pydantic_ai.models.test import TestModel
 from pydantic_ai.run import AgentRun, AgentRunResult
 from pydantic_ai.tools import RunContext
 from pydantic_ai.toolsets import AbstractToolset, FunctionToolset, WrapperToolset
-from pydantic_ai.usage import RequestUsage, RunUsage
+from pydantic_ai.usage import RequestUsage, RunUsage, UsageLimits
 
 from .conftest import IsNow, IsStr
 
@@ -2323,3 +2325,60 @@ async def test_cancel_outside_a_run_raises_user_error():
     ctx = RunContext(deps=None, model=TestModel(), usage=RunUsage())
     with pytest.raises(UserError, match='`cancel` is only available during an agent run'):
         ctx.cancel()
+
+
+@pytest.mark.parametrize('consumer_error', [False, True])
+@pytest.mark.parametrize('token_limits', [False, True])
+async def test_early_exit_from_node_stream_closes_agentstream_chain(consumer_error: bool, token_limits: bool):
+    """Walking away from a node stream closes the internal `AgentStream` generator chain.
+
+    `aclose_events()` closes only the head of the event chain. Each wrapper must forward
+    closure to its source; otherwise `_events_iter` and `_model_events` outlive the node
+    teardown and are finalized only by asyncio's GC hook, which schedules an aclose task
+    after `agent.iter()` has already returned (pydantic-ai#10667). Token limits insert the
+    usage-checking wrapper between `_events_iter` and `_model_events`, so it must forward
+    closure too.
+    """
+    finalized: list[str] = []
+    previous_first, previous_final = sys.get_asyncgen_hooks()
+
+    def record_finalization(agen: Any) -> None:
+        finalized.append(agen.ag_code.co_qualname)
+        if previous_final is not None:
+            previous_final(agen)
+
+    sys.set_asyncgen_hooks(previous_first, record_finalization)
+    try:
+
+        async def stream(_messages: list[ModelMessage], _info: AgentInfo) -> AsyncIterator[str]:
+            for piece in ('aa', 'bb', 'cc', 'dd'):
+                yield piece
+                await asyncio.sleep(0.01)
+
+        agent = Agent(FunctionModel(stream_function=stream))
+        usage_limits = UsageLimits(input_tokens_limit=1_000_000) if token_limits else None
+        if consumer_error:
+            with pytest.raises(RuntimeError, match='consumer exploded'):
+                async with agent.iter('hi', usage_limits=usage_limits) as run:
+                    async for node in run:
+                        if Agent.is_model_request_node(node):
+                            async with node.stream(run.ctx) as node_stream:
+                                async for _event in node_stream:
+                                    raise RuntimeError('consumer exploded')
+                            break
+        else:
+            async with agent.iter('hi', usage_limits=usage_limits) as run:
+                async for node in run:
+                    if Agent.is_model_request_node(node):
+                        async with node.stream(run.ctx) as node_stream:
+                            async for _event in node_stream:
+                                break
+                        break
+    finally:
+        # Collect while the recording hook is installed, then restore it.
+        await asyncio.sleep(0)
+        gc.collect()
+        sys.set_asyncgen_hooks(previous_first, previous_final)
+
+    leaked = {name for name in finalized if name in ('AgentStream._events_iter', 'AgentStream._model_events')}
+    assert not leaked, f'internal AgentStream generators reached the GC finalizer: {sorted(leaked)}'
